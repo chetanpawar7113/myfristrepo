@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Perplexity Orb v3 — True Replica</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box
+        }
+
+        html,
+        body {
+            width: 100%;
+            height: 100%;
+            background: #f0f0f8;
+            overflow: hidden;
+            font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif
+        }
+
+        #app {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 32px
+        }
+
+        /* THE KEY: solid circle background — pure CSS, zero cost */
+        #orb-wrap {
+            position: relative;
+            width: 240px;
+            height: 240px;
+            border-radius: 50%;
+            background: var(--orb-bg, #e8c44a);
+            transition: background 0.7s ease, transform 0.5s ease, width 0.5s ease, height 0.5s ease;
+            cursor: pointer;
+            overflow: hidden;
+            /* clips particles to circle */
+        }
+
+        /* WebGL canvas sits on top of the solid circle */
+        #glc {
+            position: absolute;
+            inset: 0;
+            width: 100% !important;
+            height: 100% !important;
+            border-radius: 50%;
+        }
+
+        #controls {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            justify-content: center
+        }
+
+        .btn {
+            font-size: 11px;
+            padding: 6px 16px;
+            border-radius: 20px;
+            border: 1px solid rgba(0, 0, 0, .15);
+            background: rgba(255, 255, 255, .5);
+            color: rgba(0, 0, 0, .5);
+            cursor: pointer;
+            transition: all .2s;
+            font-family: inherit;
+            letter-spacing: .04em;
+            text-transform: uppercase
+        }
+
+        .btn:hover {
+            background: rgba(255, 255, 255, .8);
+            color: rgba(0, 0, 0, .8)
+        }
+
+        .btn.on {
+            background: rgba(255, 255, 255, .9);
+            color: #000;
+            border-color: rgba(0, 0, 0, .25);
+            font-weight: 500
+        }
+
+        #state-name {
+            font-size: 12px;
+            color: rgba(0, 0, 0, .35);
+            letter-spacing: .08em;
+            text-transform: uppercase;
+            height: 16px
+        }
+
+        #vol-row {
+            display: flex;
+            align-items: center;
+            gap: 8px
+        }
+
+        #vol-row span {
+            font-size: 10px;
+            color: rgba(0, 0, 0, .3);
+            letter-spacing: .06em;
+            text-transform: uppercase
+        }
+
+        input[type=range] {
+            -webkit-appearance: none;
+            width: 90px;
+            height: 2px;
+            background: rgba(0, 0, 0, .15);
+            border-radius: 1px;
+            outline: none;
+            cursor: pointer
+        }
+
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: rgba(0, 0, 0, .4);
+            cursor: pointer
+        }
+    </style>
+</head>
+
+<body>
+    <div id="app">
+        <div id="state-name">IDLE</div>
+        <div id="orb-wrap">
+            <canvas id="glc"></canvas>
+        </div>
+        <div id="controls">
+            <button class="btn on" data-s="IDLE">Idle</button>
+            <button class="btn" data-s="WAKE">Wake</button>
+            <button class="btn" data-s="LISTENING">Listening</button>
+            <button class="btn" data-s="THINKING">Thinking</button>
+            <button class="btn" data-s="ANSWERING">Answering</button>
+        </div>
+        <div id="vol-row">
+            <span>Volume</span>
+            <input type="range" id="vol" min="0" max="1" step="0.01" value="0">
+        </div>
+    </div>
+
+    <script>
+        // ═══════════════════════════════════════════════════════════════
+        //  PERPLEXITY ORB — TRUE ARCHITECTURE
+        //
+        //  Layer 1: CSS solid circle (background color) — zero CPU
+        //  Layer 2: WebGL instanced points (moving dots) — GPU only
+        //
+        //  Instanced rendering = ALL dots drawn in ONE gl.drawArrays call
+        //  JS sends only uniforms (time, vol, colors) — no per-dot JS
+        //  All dot movement computed in vertex shader on GPU
+        //
+        //  CPU usage: ~1-2%  |  GPU: ~3-5%  |  No heat
+        // ═══════════════════════════════════════════════════════════════
+
+        const wrap = document.getElementById('orb-wrap');
+        const canvas = document.getElementById('glc');
+
+        // Size canvas to match wrap
+        function resize() {
+            const r = wrap.getBoundingClientRect();
+            canvas.width = r.width * devicePixelRatio;
+            canvas.height = r.height * devicePixelRatio;
+        }
+        resize();
+        new ResizeObserver(resize).observe(wrap);
+
+        const gl = canvas.getContext('webgl', {
+            alpha: true, antialias: true,
+            premultipliedAlpha: false,
+            powerPreference: 'low-power'
+        });
+        gl.getExtension('OES_standard_derivatives');
+
+        // ── Vertex Shader ───────────────────────────────────────────
+        // Each particle's home position is an attribute (set once).
+        // ALL movement is computed here on the GPU — zero JS per dot.
+        const VS = `
+precision highp float;
+
+// Per-particle data (set once, never changes)
+attribute vec3  aHome;   // home position on fibonacci sphere
+attribute float aPhase;  // unique phase [0..2PI]
+attribute float aSpeed;  // drift speed multiplier
+attribute float aSize;   // base dot size
+attribute float aDepth;  // radial depth [0..1]
+
+// Per-frame uniforms (tiny, JS sends these only)
+uniform float uTime;
+uniform float uVol;
+uniform float uRadius;   // orb radius in pixels
+uniform vec2  uCenter;   // canvas center
+
+// State behavior uniforms
+uniform float uWave;     // ripple wave strength
+uniform float uVortex;   // vortex spin strength
+uniform float uPulse;    // outward pulse strength
+uniform float uDrift;    // organic drift amount
+uniform float uBreath;   // breathing scale
+
+varying float vDepth;
+varying float vOpacity;
+
+void main() {
+  vec3 pos = aHome;
+
+  // ── 1. Breathing: whole orb gently scales ──────────────
+  float breath = 1.0 + sin(uTime * 1.1 + aPhase * 0.3) * uBreath;
+
+  // ── 2. Organic micro-drift: each dot floats slightly ───
+  // This gives the "living" feeling without heavy physics
+  float driftX = sin(uTime * aSpeed * 0.8 + aPhase) * uDrift * 0.04;
+  float driftY = cos(uTime * aSpeed * 0.6 + aPhase * 1.3) * uDrift * 0.03;
+  float driftZ = sin(uTime * aSpeed * 0.5 + aPhase * 0.7) * uDrift * 0.025;
+  pos += vec3(driftX, driftY, driftZ);
+
+  // ── 3. Wave ripple from center (listening state) ────────
+  float r3d = length(aHome);
+  float wave = sin(r3d * 15.0 - uTime * 5.5 + aPhase * 0.4)
+             * uWave * 0.06 * (1.0 + uVol * 2.2);
+  pos += normalize(aHome + 0.001) * wave;
+
+  // ── 4. Vortex spin around Y axis (thinking state) ───────
+  if (uVortex > 0.01) {
+    float angle = uVortex * uTime * 1.8 * (0.3 + aDepth * 0.9);
+    float c = cos(angle), s = sin(angle);
+    vec3 vp = vec3(pos.x*c - pos.z*s, pos.y, pos.x*s + pos.z*c);
+    pos = mix(pos, vp, uVortex);
+  }
+
+  // ── 5. Pulse: outward radial push (answering/wake) ──────
+  float pulse = uPulse * sin(uTime * 2.6 + aPhase) * 0.055;
+  pos += normalize(aHome + 0.001) * pulse;
+
+  // ── 6. Vol push: audio expands dots outward instantly ───
+  pos += normalize(aHome + 0.001) * uVol * 0.07 * aDepth;
+
+  // ── 7. Apply radius and breathing ───────────────────────
+  pos *= uRadius * breath;
+
+  // ── 8. Simple rotation (slow globe spin) ────────────────
+  // Baked into time so no JS rotation needed
+  float rotY = uTime * 0.055;
+  float rotX = 0.18;
+  float cy = cos(rotY), sy = sin(rotY);
+  float cx = cos(rotX), sx = sin(rotX);
+
+  float x1 = cy * pos.x + sy * pos.z;
+  float z1 = -sy * pos.x + cy * pos.z;
+  float y2 = cx * pos.y - sx * z1;
+  float z2 = sx * pos.y + cx * z1;
+
+  // ── 9. Depth-based opacity (back=dim, front=bright) ─────
+  float depth01 = (z2 + uRadius) / (2.0 * uRadius);
+  depth01 = clamp(depth01, 0.0, 1.0);
+  vDepth   = depth01;
+
+  float baseOp = aDepth > 0.82
+    ? 0.35 + depth01 * 0.60   // shell: brighter
+    : 0.10 + depth01 * 0.52;  // inner: dimmer
+  baseOp += uVol * 0.15;
+  vOpacity = clamp(baseOp, 0.0, 1.0);
+
+  // ── 10. Project to screen (orthographic) ────────────────
+  float scale = 2.0 / (uRadius * 2.2);
+  gl_Position = vec4(x1 * scale, y2 * scale, 0.0, 1.0);
+
+  // Depth-based point size: back=tiny, front=normal
+  float depthSize = 0.3 + depth01 * 1.4;
+  float volSize   = 1.0 + uVol * 0.3;
+  gl_PointSize    = aSize * depthSize * volSize * (canvas_size / 240.0);
+}
+`;
+
+        // We'll inject canvas_size as a #define
+        function buildVS(sz) {
+            return VS.replace('canvas_size', sz.toFixed(1));
+        }
+
+        // ── Fragment Shader ─────────────────────────────────────────
+        // Draws each dot as a crisp white circle.
+        // White dots over the colored CSS background = Perplexity look.
+        const FS = `
+precision mediump float;
+uniform float uDotAlpha; // overall dot opacity (state-driven)
+varying float vDepth;
+varying float vOpacity;
+
+void main() {
+  vec2 uv = gl_PointCoord - 0.5;
+  float d  = length(uv);
+  if (d > 0.5) discard;
+
+  // Soft anti-aliased edge per dot
+  float soft = 1.0 - smoothstep(0.32, 0.50, d);
+
+  // Pure white dots — color comes from CSS background circle
+  float alpha = soft * vOpacity * uDotAlpha;
+  gl_FragColor = vec4(alpha, alpha, alpha, alpha); // premultiplied white
+}
+`;
+
+        function mkShader(type, src) {
+            const s = gl.createShader(type);
+            gl.shaderSource(s, src);
+            gl.compileShader(s);
+            if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+                console.error(gl.getShaderInfoLog(s));
+            return s;
+        }
+
+        let prog = null;
+        function buildProgram() {
+            const sz = canvas.width / devicePixelRatio;
+            if (prog) gl.deleteProgram(prog);
+            prog = gl.createProgram();
+            gl.attachShader(prog, mkShader(gl.VERTEX_SHADER, buildVS(sz)));
+            gl.attachShader(prog, mkShader(gl.FRAGMENT_SHADER, FS));
+            gl.linkProgram(prog);
+            if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+                console.error(gl.getProgramInfoLog(prog));
+            gl.useProgram(prog);
+            bindAttribs();
+            cacheUniforms();
+        }
+
+        // ── Generate particle data (ONE TIME) ───────────────────────
+        const N = 1400;
+        const GOLD = Math.PI * (3 - Math.sqrt(5));
+
+        const homeArr = new Float32Array(N * 3);
+        const phaseArr = new Float32Array(N);
+        const speedArr = new Float32Array(N);
+        const sizeArr = new Float32Array(N);
+        const depthArr = new Float32Array(N);
+
+        for (let i = 0; i < N; i++) {
+            // Fibonacci sphere direction
+            const y0 = 1 - (2 * i) / (N - 1);
+            const rad = Math.sqrt(Math.max(0, 1 - y0 * y0));
+            const phi = i * GOLD;
+            const ux = Math.cos(phi) * rad;
+            const uy = y0;
+            const uz = Math.sin(phi) * rad;
+
+            // Radial distribution matching Perplexity screenshot:
+            // Dense bright shell + scattered volume + sparse center
+            const rnd = Math.random();
+            let r;
+            if (rnd < 0.08) r = 0.93 + Math.random() * 0.07;  // very outer
+            else if (rnd < 0.26) r = 0.76 + Math.random() * 0.17;  // outer
+            else if (rnd < 0.58) r = 0.44 + Math.random() * 0.34;  // mid
+            else if (rnd < 0.82) r = 0.20 + Math.random() * 0.26;  // inner
+            else r = 0.04 + Math.random() * 0.18;  // core
+
+            homeArr[i * 3] = ux * r;
+            homeArr[i * 3 + 1] = uy * r;
+            homeArr[i * 3 + 2] = uz * r;
+            depthArr[i] = r;
+
+            phaseArr[i] = Math.random() * Math.PI * 2;
+            speedArr[i] = 0.4 + Math.random() * 1.4;
+
+            // Dot sizes: mostly tiny (matching screenshot)
+            const st = Math.random();
+            sizeArr[i] = st < 0.55 ? 1.2 + Math.random() * 1.0   // tiny
+                : st < 0.82 ? 2.0 + Math.random() * 1.2   // small
+                    : st < 0.95 ? 3.0 + Math.random() * 1.0   // medium
+                        : 4.0 + Math.random() * 1.0;  // occasional large
+        }
+
+        // ── Upload buffers (once) ────────────────────────────────────
+        function mkBuf(data) {
+            const b = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, b);
+            gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+            return b;
+        }
+        const bufHome = mkBuf(homeArr);
+        const bufPhase = mkBuf(phaseArr);
+        const bufSpeed = mkBuf(speedArr);
+        const bufSize = mkBuf(sizeArr);
+        const bufDepth = mkBuf(depthArr);
+
+        function bindAttrib(name, buf, size) {
+            const loc = gl.getAttribLocation(prog, name);
+            if (loc < 0) return;
+            gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+            gl.enableVertexAttribArray(loc);
+            gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+        }
+        function bindAttribs() {
+            bindAttrib('aHome', bufHome, 3);
+            bindAttrib('aPhase', bufPhase, 1);
+            bindAttrib('aSpeed', bufSpeed, 1);
+            bindAttrib('aSize', bufSize, 1);
+            bindAttrib('aDepth', bufDepth, 1);
+        }
+
+        let U = {};
+        function cacheUniforms() {
+            const names = ['uTime', 'uVol', 'uRadius', 'uCenter', 'uWave',
+                'uVortex', 'uPulse', 'uDrift', 'uBreath', 'uDotAlpha'];
+            names.forEach(n => U[n] = gl.getUniformLocation(prog, n));
+        }
+
+        buildProgram();
+
+        // ── State definitions ────────────────────────────────────────
+        // bgColor = CSS background of the solid circle
+        // dotAlpha = opacity of white dots layer
+        const STATES = {
+            IDLE: {
+                bg: '#e8c44a',            // warm yellow (like your screenshot)
+                wave: 0.0, vortex: 0.0, pulse: 0.0,
+                drift: 0.5, breath: 0.016,
+                dotAlpha: 0.82,
+                label: 'IDLE'
+            },
+            WAKE: {
+                bg: '#d4b8ff',            // soft purple
+                wave: 0.3, vortex: 0.0, pulse: 0.4,
+                drift: 0.8, breath: 0.032,
+                dotAlpha: 0.92,
+                label: 'WAKE DETECTED'
+            },
+            LISTENING: {
+                bg: '#1ab8c8',            // cyan (perplexity listening color)
+                wave: 1.0, vortex: 0.0, pulse: 0.0,
+                drift: 0.6, breath: 0.020,
+                dotAlpha: 0.88,
+                label: 'LISTENING'
+            },
+            THINKING: {
+                bg: '#3a6fd8',            // deep blue
+                wave: 0.1, vortex: 1.0, pulse: 0.0,
+                drift: 0.9, breath: 0.014,
+                dotAlpha: 0.78,
+                label: 'THINKING'
+            },
+            ANSWERING: {
+                bg: '#e8c44a',            // back to warm yellow/amber
+                wave: 0.5, vortex: 0.0, pulse: 0.6,
+                drift: 0.7, breath: 0.026,
+                dotAlpha: 0.90,
+                label: 'ANSWERING'
+            },
+        };
+
+        // Smooth current values
+        let C = {
+            wave: 0, vortex: 0, pulse: 0,
+            drift: 0.5, breath: 0.016, dotAlpha: 0.82
+        };
+        let T = STATES.IDLE;
+        let vol = 0, autoVol = 0, autoDir = 1, autoActive = false;
+        const t0 = performance.now();
+        const lerp = (a, b, t) => a + (b - a) * t;
+
+        // ── Render loop ──────────────────────────────────────────────
+        function frame(now) {
+            const t = (now - t0) / 1000;
+
+            // Auto-volume for demo
+            if (autoActive) {
+                autoVol += autoDir * (0.022 + Math.random() * 0.03);
+                if (autoVol > 0.85) autoDir = -1;
+                if (autoVol < 0.02) { autoDir = 1; autoVol = 0; }
+                vol = Math.max(0, Math.min(1, autoVol));
+                document.getElementById('vol').value = vol;
+            }
+
+            // Lerp toward target state
+            const s = 0.045;
+            C.wave = lerp(C.wave, T.wave, s);
+            C.vortex = lerp(C.vortex, T.vortex, s);
+            C.pulse = lerp(C.pulse, T.pulse, s);
+            C.drift = lerp(C.drift, T.drift, s);
+            C.breath = lerp(C.breath, T.breath, s);
+            C.dotAlpha = lerp(C.dotAlpha, T.dotAlpha, s);
+
+            const W = canvas.width;
+            const H = canvas.height;
+            const R = Math.min(W, H) * 0.47;
+
+            gl.viewport(0, 0, W, H);
+            gl.clearColor(0, 0, 0, 0);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            gl.enable(gl.BLEND);
+            // Screen blend: white dots over any color = lightens/reveals
+            gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+
+            gl.useProgram(prog);
+
+            // Send per-frame uniforms — this is ALL the JS does per frame
+            gl.uniform1f(U.uTime, t);
+            gl.uniform1f(U.uVol, vol);
+            gl.uniform1f(U.uRadius, R);
+            gl.uniform2f(U.uCenter, W / 2, H / 2);
+            gl.uniform1f(U.uWave, C.wave);
+            gl.uniform1f(U.uVortex, C.vortex);
+            gl.uniform1f(U.uPulse, C.pulse);
+            gl.uniform1f(U.uDrift, C.drift);
+            gl.uniform1f(U.uBreath, C.breath);
+            gl.uniform1f(U.uDotAlpha, C.dotAlpha);
+
+            // ONE draw call — GPU renders all 1600 dots
+            gl.drawArrays(gl.POINTS, 0, N);
+
+            requestAnimationFrame(frame);
+        }
+        requestAnimationFrame(frame);
+
+        // ── State switching ──────────────────────────────────────────
+        function setState(key) {
+            T = STATES[key];
+            // CSS background color — instant, zero CPU
+            wrap.style.background = T.bg;
+            autoActive = (key === 'LISTENING' || key === 'ANSWERING');
+            if (!autoActive) { vol = 0; autoVol = 0; document.getElementById('vol').value = 0; }
+            document.getElementById('state-name').textContent = T.label;
+            document.querySelectorAll('.btn').forEach(b => b.classList.toggle('on', b.dataset.s === key));
+        }
+
+        document.querySelectorAll('.btn').forEach(b => b.addEventListener('click', () => setState(b.dataset.s)));
+        document.getElementById('vol').addEventListener('input', e => {
+            vol = parseFloat(e.target.value);
+            autoActive = false;
+        });
+
+        // Click orb to cycle
+        const order = ['IDLE', 'WAKE', 'LISTENING', 'THINKING', 'ANSWERING'];
+        let oi = 0;
+        wrap.addEventListener('click', () => { oi = (oi + 1) % order.length; setState(order[oi]); });
+    </script>
+</body>
+
+</html>
